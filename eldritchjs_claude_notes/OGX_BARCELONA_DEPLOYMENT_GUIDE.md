@@ -78,11 +78,12 @@
 ┌────────────────────────────────────────────────────────────────┐
 │  OGX Platform Namespace: ogx-platform                          │
 │  ┌──────────────────────────────────────────────────────────┐  │
-│  │ OGX Server Deployment (3 replicas)                       │  │
+│  │ OGX Server (managed by operator, 3 replicas)             │  │
 │  │ - Multi-SDK API (OpenAI, Anthropic, Google)              │  │
 │  │ - Per-researcher quotas & access control                 │  │
 │  │ - Usage tracking (all requests logged)                   │  │
 │  │ - Data isolation enforcement                             │  │
+│  │ - Declarative OGXDistribution custom resource            │  │
 │  └──────────────────────────────────────────────────────────┘  │
 │                               ↓                                 │
 │              Routes to inference & storage backends             │
@@ -111,11 +112,12 @@
 ```
 
 **Key Design Decisions:**
-1. **Central OGX Instance** - Single OGX deployment serves all researchers
-2. **Namespace Isolation** - Each researcher gets own namespace for apps/data
-3. **NetworkPolicies** - Researchers can only talk to OGX, not each other
-4. **Per-Researcher Quotas** - Usage limits enforced by OGX
-5. **Audit Trail** - All requests logged with researcher identity
+1. **Operator-Managed OGX** - OGX deployed via Kubernetes operator for declarative management, automatic config reloading, and simplified upgrades
+2. **Central OGX Instance** - Single OGX deployment serves all researchers
+3. **Namespace Isolation** - Each researcher gets own namespace for apps/data
+4. **NetworkPolicies** - Researchers can only talk to OGX, not each other
+5. **Per-Researcher Quotas** - Usage limits enforced by OGX
+6. **Audit Trail** - All requests logged with researcher identity
 
 ---
 
@@ -542,7 +544,28 @@ EOF
 oc exec -n ogx-inference deployment/ollama -- ollama pull llama3.2:3b
 ```
 
-### Step 4: Deploy OGX
+### Step 4a: Install OGX Kubernetes Operator
+
+The OGX Kubernetes Operator manages OGX deployments declaratively using the `OGXDistribution` custom resource.
+
+```bash
+# Install the operator from the latest release
+oc apply -f https://raw.githubusercontent.com/ogx-ai/ogx-k8s-operator/main/release/operator.yaml
+
+# Verify operator is running
+oc get pods -n ogx-k8s-operator-system
+
+# Wait for operator to be ready
+oc wait --for=condition=ready pod -l control-plane=controller-manager -n ogx-k8s-operator-system --timeout=300s
+```
+
+**What the operator provides:**
+- Declarative `OGXDistribution` custom resource
+- Automatic Deployment, Service, and PVC management
+- Config hot-reloading via ConfigMap updates
+- Upgrade management for OGX versions
+
+### Step 4b: Deploy OGX Using Operator
 
 **Create OGX ConfigMap:**
 
@@ -716,104 +739,64 @@ data:
 EOF
 ```
 
-**Deploy OGX Server:**
+**Deploy OGX via Operator:**
 
 ```bash
-# Create ServiceAccount
-oc create serviceaccount ogx-server -n ogx-platform
-
-# Deploy OGX
 cat <<EOF | oc apply -f -
 ---
-apiVersion: apps/v1
-kind: Deployment
+apiVersion: ogx.io/v1alpha1
+kind: OGXDistribution
 metadata:
-  name: ogx-server
+  name: ogx-barcelona
   namespace: ogx-platform
-  labels:
-    app: ogx-server
 spec:
   replicas: 3
-  selector:
-    matchLabels:
-      app: ogx-server
-  template:
-    metadata:
-      labels:
-        app: ogx-server
-    spec:
-      serviceAccountName: ogx-server
-      containers:
-      - name: ogx
-        image: docker.io/ogx/distribution-starter:1.0.3
-        imagePullPolicy: IfNotPresent
-        ports:
-        - containerPort: 8321
-          name: http
-        env:
-        # PostgreSQL credentials
-        - name: POSTGRES_PASSWORD
-          valueFrom:
-            secretKeyRef:
-              name: postgresql-credentials
-              key: password
-        
-        # Storage paths
-        - name: SQLITE_STORE_DIR
-          value: "/data/ogx"
-        
-        resources:
-          requests:
-            memory: "2Gi"
-            cpu: "1000m"
-          limits:
-            memory: "4Gi"
-            cpu: "2000m"
-        
-        livenessProbe:
-          httpGet:
-            path: /health
-            port: 8321
-          initialDelaySeconds: 30
-          periodSeconds: 10
-        
-        readinessProbe:
-          httpGet:
-            path: /health
-            port: 8321
-          initialDelaySeconds: 5
-          periodSeconds: 5
-        
-        volumeMounts:
-        - name: ogx-config
-          mountPath: /etc/ogx/config.yaml
-          subPath: config.yaml
-        - name: data
-          mountPath: /data
-      
-      volumes:
-      - name: ogx-config
-        configMap:
-          name: ogx-config
-      - name: data
-        emptyDir: {}
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: ogx-api
-  namespace: ogx-platform
-  labels:
-    app: ogx-server
-spec:
-  type: ClusterIP
-  ports:
-  - port: 8321
-    targetPort: 8321
-    protocol: TCP
-    name: http
-  selector:
-    app: ogx-server
+  server:
+    distribution:
+      name: starter  # Use the starter distribution
+    containerSpec:
+      port: 8321
+      env:
+      # PostgreSQL credentials
+      - name: POSTGRES_PASSWORD
+        valueFrom:
+          secretKeyRef:
+            name: postgresql-credentials
+            key: password
+      resources:
+        requests:
+          memory: "2Gi"
+          cpu: "1000m"
+        limits:
+          memory: "4Gi"
+          cpu: "2000m"
+    # Override default config with our multi-tenant setup
+    userConfig:
+      configMap:
+        name: ogx-config
+    storage:
+      size: "50Gi"
+      storageClassName: ocs-external-storagecluster-ceph-rbd
+      mountPath: "/data/ogx"
+EOF
+
+# Wait for the operator to create the deployment
+sleep 10
+
+# Wait for OGX pods to be ready
+oc wait --for=condition=ready pod -l app.kubernetes.io/name=ogx,app.kubernetes.io/instance=ogx-barcelona -n ogx-platform --timeout=300s
+
+# Check the OGXDistribution status
+oc get ogxdistribution ogx-barcelona -n ogx-platform
+oc describe ogxdistribution ogx-barcelona -n ogx-platform
+```
+
+**Create OpenShift Route:**
+
+The operator creates a Service but not a Route. Create the Route manually:
+
+```bash
+cat <<EOF | oc apply -f -
 ---
 apiVersion: route.openshift.io/v1
 kind: Route
@@ -824,34 +807,46 @@ spec:
   host: ogx-api.apps.barcelona.nerc.mghpcc.org
   to:
     kind: Service
-    name: ogx-api
+    name: ogx-barcelona-service  # Service created by operator
   port:
-    targetPort: http
+    targetPort: 8321
   tls:
     termination: edge
     insecureEdgeTerminationPolicy: Redirect
 EOF
+```
 
-# Wait for OGX to be ready
-oc wait --for=condition=ready pod -l app=ogx-server -n ogx-platform --timeout=300s
+**Test OGX Health:**
 
-# Test OGX health
-oc exec -n ogx-platform deployment/ogx-server -- curl localhost:8321/health
+```bash
+# Internal health check
+oc exec -n ogx-platform -l app.kubernetes.io/instance=ogx-barcelona -- curl -s localhost:8321/health
+
+# External health check
+curl -k https://ogx-api.apps.barcelona.nerc.mghpcc.org/health
+# Should return: {"status": "healthy"}
 ```
 
 ### Step 5: Verify Deployment
 
 ```bash
+# Check OGXDistribution status
+oc get ogxdistribution ogx-barcelona -n ogx-platform
+# Should show: READY=True, REPLICAS=3/3
+
 # Check all pods are running
-oc get pods -n ogx-platform
+oc get pods -n ogx-platform -l app.kubernetes.io/instance=ogx-barcelona
 oc get pods -n ogx-inference
 oc get pods -n ogx-storage
 
-# Test OGX externally
+# Verify operator-created resources
+oc get deployment,service,pvc -n ogx-platform -l app.kubernetes.io/instance=ogx-barcelona
+
+# Test OGX health
 curl -k https://ogx-api.apps.barcelona.nerc.mghpcc.org/health
 # Should return: {"status": "healthy"}
 
-# Test inference through OGX
+# Test inference through OGX (requires API key setup - see Multi-Tenancy section)
 curl -k https://ogx-api.apps.barcelona.nerc.mghpcc.org/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer researcher-a-key" \
@@ -978,7 +973,9 @@ cat <<EOF
 EOF
 
 echo ""
-echo "Then run: oc rollout restart deployment/ogx-server -n ogx-platform"
+echo "Then update the ConfigMap and the operator will restart OGX automatically:"
+echo "  1. Edit: oc edit configmap ogx-config -n ogx-platform"
+echo "  2. Or manually restart: oc rollout restart deployment/ogx-barcelona -n ogx-platform"
 ```
 
 **Usage:**
@@ -1497,9 +1494,10 @@ metadata:
 spec:
   selector:
     matchLabels:
-      app: ogx-server
+      app.kubernetes.io/name: ogx
+      app.kubernetes.io/instance: ogx-barcelona
   endpoints:
-  - port: metrics
+  - port: 8321  # OGX server port
     interval: 30s
     path: /metrics
 ```
@@ -1642,20 +1640,24 @@ Questions? Contact: [support-email]
 
 **Symptom:**
 ```bash
-oc get pods -n ogx-platform
-# NAME                         READY   STATUS             RESTARTS
-# ogx-server-xxxxx             0/1     CrashLoopBackOff   5
+oc get pods -n ogx-platform -l app.kubernetes.io/instance=ogx-barcelona
+# NAME                            READY   STATUS             RESTARTS
+# ogx-barcelona-xxxxx             0/1     CrashLoopBackOff   5
 ```
 
 **Diagnosis:**
 ```bash
-# Check logs
-oc logs -n ogx-platform deployment/ogx-server
+# Check OGXDistribution status
+oc describe ogxdistribution ogx-barcelona -n ogx-platform
+
+# Check pod logs
+oc logs -n ogx-platform -l app.kubernetes.io/instance=ogx-barcelona
 
 # Common causes:
 # - Database connection failure
 # - Invalid config
 # - Missing secrets
+# - Operator issues
 ```
 
 **Solution:**
@@ -1663,8 +1665,9 @@ oc logs -n ogx-platform deployment/ogx-server
 # 1. Verify PostgreSQL is running
 oc get pods -n ogx-storage -l app=postgresql
 
-# 2. Test database connectivity
-oc exec -n ogx-platform deployment/ogx-server -- \
+# 2. Test database connectivity from OGX pod
+POD=$(oc get pod -n ogx-platform -l app.kubernetes.io/instance=ogx-barcelona -o jsonpath='{.items[0].metadata.name}')
+oc exec -n ogx-platform $POD -- \
   nc -zv postgresql.ogx-storage.svc.cluster.local 5432
 
 # 3. Check config
@@ -1672,6 +1675,9 @@ oc get configmap ogx-config -n ogx-platform -o yaml
 
 # 4. Check secrets
 oc get secret postgresql-credentials -n ogx-storage
+
+# 5. Check operator logs if issue persists
+oc logs -n ogx-k8s-operator-system -l control-plane=controller-manager
 ```
 
 ### Issue: vLLM Out of Memory
@@ -1718,11 +1724,12 @@ GROUP BY principal;
 oc edit configmap ogx-config -n ogx-platform
 # Change quota.requests_per_day: 5000
 
-# Restart OGX
-oc rollout restart deployment/ogx-server -n ogx-platform
+# The operator should automatically reload config, or manually restart:
+oc rollout restart deployment/ogx-barcelona -n ogx-platform
 
 # Option 2: Reset quota manually (emergency)
-oc exec -n ogx-platform deployment/ogx-server -- \
+POD=$(oc get pod -n ogx-platform -l app.kubernetes.io/instance=ogx-barcelona -o jsonpath='{.items[0].metadata.name}')
+oc exec -n ogx-platform $POD -- \
   ogx admin quota-reset --researcher researcher-a
 ```
 
@@ -1809,7 +1816,7 @@ oc get nodes
 oc get pods --all-namespaces
 
 # OGX logs
-oc logs -f -n ogx-platform deployment/ogx-server
+oc logs -f -n ogx-platform -l app.kubernetes.io/instance=ogx-barcelona
 
 # vLLM logs
 oc logs -f -n ogx-inference deployment/vllm
