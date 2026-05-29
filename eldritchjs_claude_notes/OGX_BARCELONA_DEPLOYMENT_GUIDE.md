@@ -159,6 +159,92 @@ oc get nodes -o json | jq -r '.items[] | select(.status.capacity."nvidia.com/gpu
 
 ---
 
+## GPU Cost Awareness
+
+**IMPORTANT: Only vLLM claims GPU resources. All other OGX components run on CPU-only nodes.**
+
+### Which Components Use GPUs?
+
+| Component | GPU Usage | Cost Impact |
+|-----------|-----------|-------------|
+| **vLLM** | ✅ **YES** - Requests 4 GPUs per pod | **Billed for GPU time** |
+| OGX Server | ❌ No - CPU-only | Free (CPU nodes) |
+| Ollama | ❌ No - CPU-only | Free (CPU nodes) |
+| PostgreSQL | ❌ No - CPU-only | Free (CPU nodes) |
+| Redis | ❌ No - CPU-only | Free (CPU nodes) |
+
+**vLLM deployment claims:**
+- 4 GPUs per replica
+- If you deploy 1 vLLM replica = 4 H100s allocated = **billed**
+- If you deploy 5 vLLM replicas = 20 H100s allocated = **billed**
+
+### Testing OGX Without GPU Costs
+
+**You can fully test OGX features without deploying vLLM:**
+
+1. **Skip Step 3** (Deploy Inference Layer) in the Quick Start
+2. Deploy only OGX + PostgreSQL + Redis + Ollama (all CPU-only)
+3. Test with Ollama CPU inference for small models
+
+**What you can test without GPUs:**
+- ✅ Multi-tenancy (researcher namespaces, access control)
+- ✅ Quota enforcement
+- ✅ Usage tracking and audit logs
+- ✅ API compatibility (OpenAI, Anthropic SDKs)
+- ✅ Responses API orchestration
+- ✅ Vector storage (pgvector)
+- ✅ Small model inference via Ollama (slower, but functional)
+
+**When to deploy vLLM (incurs GPU costs):**
+- Production workloads requiring high throughput
+- Large model inference (70B+ parameter models)
+- Performance benchmarking
+- After validating OGX setup on CPU-only components
+
+### Verify No GPUs Are Allocated
+
+```bash
+# Check if any pods are using GPUs
+oc get pods --all-namespaces -o json | \
+  jq -r '.items[] | select(.spec.containers[].resources.limits."nvidia.com/gpu" != null) | 
+  "\(.metadata.namespace)/\(.metadata.name): \(.spec.containers[0].resources.limits."nvidia.com/gpu") GPUs"'
+
+# Should return empty if vLLM is not deployed
+# If vLLM is deployed, you'll see:
+# ogx-inference/vllm-xxxxx: 4 GPUs
+
+# Check GPU node allocation
+oc describe nodes | grep -A 5 "Allocated resources" | grep nvidia
+
+# View GPU quota usage by namespace
+oc get resourcequota --all-namespaces
+```
+
+### Cost-Saving Deployment Path
+
+**Phase 1: Free tier (CPU-only testing)**
+```bash
+# Deploy: OGX + PostgreSQL + Redis + Ollama
+# Skip vLLM deployment entirely
+# Use Ollama with llama-3.2-3b for testing
+# Cost: $0 GPU charges
+```
+
+**Phase 2: GPU deployment (when ready)**
+```bash
+# Deploy vLLM with 1 replica (4 GPUs)
+# Test production workloads
+# Cost: 4 H100 GPUs charged
+```
+
+**Phase 3: Production scale (high throughput)**
+```bash
+# Scale vLLM to 5 replicas (20 GPUs)
+# Cost: 20 H100 GPUs charged
+```
+
+---
+
 ## Quick Start Deployment
 
 ### Step 1: Create Namespaces
@@ -324,6 +410,19 @@ EOF
 
 ### Step 3: Deploy Inference Layer
 
+> **⚠️ GPU COST WARNING**  
+> **This step deploys vLLM which will claim 4 H100 GPUs and incur GPU charges.**
+>
+> You can skip this step for initial testing and use only Ollama (CPU-only) instead.  
+> See [GPU Cost Awareness](#gpu-cost-awareness) section for details.
+>
+> To proceed without GPU costs:
+> 1. Skip vLLM deployment (this entire section)
+> 2. Deploy only Ollama (CPU-only, shown below)
+> 3. Update OGX config to use only `ollama` provider
+
+#### Option A: Deploy vLLM (Uses 4 GPUs - Incurs Costs)
+
 **Download and prepare Llama model:**
 
 ```bash
@@ -487,7 +586,13 @@ oc logs -f deployment/vllm -n ogx-inference
 # Once you see "Uvicorn running on http://0.0.0.0:8000", it's ready
 ```
 
-**Deploy Ollama (CPU, for smaller models/dev):**
+#### Option B: Deploy Ollama Only (CPU-Only - No GPU Costs)
+
+> **✅ NO GPU COSTS**  
+> Ollama runs on CPU-only nodes and does not claim any GPU resources.
+> Perfect for testing OGX features, multi-tenancy, and small model inference.
+
+**Deploy Ollama:**
 
 ```bash
 cat <<EOF | oc apply -f -
@@ -569,6 +674,10 @@ oc wait --for=condition=ready pod -l control-plane=controller-manager -n ogx-k8s
 
 **Create OGX ConfigMap:**
 
+> **Configuration Note:**
+> - If you deployed **vLLM** (Option A): Use the config below as-is (includes both vLLM and Ollama providers)
+> - If you deployed **Ollama only** (Option B): Remove the `vllm` provider section and keep only `ollama`
+
 ```bash
 cat <<EOF | oc apply -f -
 ---
@@ -591,12 +700,14 @@ data:
     
     providers:
       inference:
+        # ⚠️ vLLM provider - REMOVE this section if you skipped vLLM deployment (Option B)
         - provider_id: vllm
           provider_type: remote::vllm
           config:
             base_url: http://vllm.ogx-inference.svc.cluster.local:8000/v1
             max_tokens: 8192
         
+        # ✅ Ollama provider - CPU-only, no GPU costs
         - provider_id: ollama
           provider_type: remote::ollama
           config:
@@ -690,10 +801,12 @@ data:
     
     registered_resources:
       models:
+        # ⚠️ vLLM model - REMOVE this if you skipped vLLM deployment
         - model_id: llama-3.3-70b
           provider_id: vllm
           model_type: llm
         
+        # ✅ Ollama model - CPU-only
         - model_id: llama-3.2-3b
           provider_id: ollama
           model_type: llm
@@ -703,8 +816,8 @@ data:
       # Researcher A: Medical imaging research
       - principal: "researcher:researcher-a"
         allowed_models:
-          - "llama-3.3-70b"
-          - "llama-3.2-3b"
+          - "llama-3.3-70b"  # ⚠️ vLLM (GPU) - remove if skipped vLLM deployment
+          - "llama-3.2-3b"   # ✅ Ollama (CPU-only)
         allowed_tools:
           - "file_search"
         quota:
@@ -716,7 +829,7 @@ data:
       # Researcher B: Clinical NLP
       - principal: "researcher:researcher-b"
         allowed_models:
-          - "llama-3.3-70b"
+          - "llama-3.3-70b"  # ⚠️ vLLM (GPU) - remove if skipped vLLM deployment
         allowed_tools:
           - "file_search"
         quota:
@@ -725,10 +838,10 @@ data:
           max_tokens_per_request: 4000
           max_concurrent_requests: 10
       
-      # Default: New researchers (conservative limits)
+      # Default: New researchers (conservative limits, CPU-only for testing)
       - principal: "researcher:default"
         allowed_models:
-          - "llama-3.2-3b"
+          - "llama-3.2-3b"  # ✅ Ollama (CPU-only)
         allowed_tools:
           - "file_search"
         quota:
