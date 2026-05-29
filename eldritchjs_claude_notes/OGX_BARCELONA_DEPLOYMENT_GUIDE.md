@@ -31,8 +31,8 @@
 - **OpenShift Version:** 4.20.10 (Kubernetes v1.33.6)
 - **Control Plane:** 3 nodes
 - **Worker Nodes:** 8 nodes
-  - 5 CPU-only workers
-  - **2 H100 GPU nodes** (4x H100 per node = 8 H100 GPUs total)
+  - 3 CPU-only workers
+  - **5 H100 GPU nodes** (4x H100-80GB per node = 20 H100 GPUs total)
 - **Ingress Domain:** `*.apps.barcelona.nerc.mghpcc.org`
 
 **Storage Classes:**
@@ -135,8 +135,8 @@ oc auth can-i '*' '*'
 # Should output: yes
 
 # Verify GPU nodes are ready
-oc get nodes -l node-role.kubernetes.io/h100
-# Should show 2 nodes with Ready status
+oc get nodes -o json | jq -r '.items[] | select(.status.capacity."nvidia.com/gpu" != null) | "\(.metadata.name): \(.status.capacity."nvidia.com/gpu") GPUs"'
+# Should show 5 nodes with 4 H100-80GB GPUs each (20 total)
 ```
 
 ### Resource Planning
@@ -148,9 +148,9 @@ oc get nodes -l node-role.kubernetes.io/h100
 - **Total:** ~25Gi RAM, 6 CPU cores
 
 **Inference (ogx-inference namespace):**
-- **vLLM:** 1 pod with 4x H100 GPUs, 400Gi RAM
+- **vLLM:** 1-5 pods with 4x H100-80GB GPUs each (can scale across all 5 GPU nodes)
 - **Ollama:** 3 replicas (CPU), 4Gi RAM each = 12Gi total
-- **Total:** 4 GPUs, 412Gi RAM, 12 CPU cores
+- **Total:** Up to 20 H100 GPUs available, scalable based on demand
 
 **Storage (ogx-storage namespace):**
 - **PostgreSQL PVC:** 100Gi (Ceph RBD)
@@ -1340,11 +1340,20 @@ EOF
 
 ### Current GPU Setup
 
-Barcelona has **8 H100 GPUs** across 2 nodes (4 per node).
+Barcelona has **20 H100-80GB GPUs** across 5 nodes (4 per node):
 
-**GPU Node Labels:**
-```
-node-role.kubernetes.io/h100=""
+- moc-r4pcc02u15-yunshi: 4x H100-80GB
+- moc-r4pcc02u16-yunshi: 4x H100-80GB
+- moc-r4pcc02u17-nairr: 4x H100-80GB
+- moc-r4pcc02u18-nairr: 4x H100-80GB
+- moc-r4pcc02u25-nairr: 4x H100-80GB
+
+**GPU Detection:**
+```bash
+# All nodes have these labels
+nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3
+nvidia.com/gpu.count: 4
+nvidia.com/gpu.memory: 81559  # MB per GPU
 ```
 
 **GPU Resource:**
@@ -1357,32 +1366,32 @@ nvidia.com/gpu: 4  (per node)
 **Current vLLM deployment uses 4 GPUs** (one node):
 
 ```yaml
-nodeSelector:
-  node-role.kubernetes.io/h100: ""
-
+# No specific nodeSelector needed - scheduler picks any GPU node
 resources:
   limits:
     nvidia.com/gpu: "4"  # All 4 GPUs on one node
 ```
 
-**This leaves 4 H100 GPUs available** on the second node for:
+**This leaves 16 H100 GPUs available** across 4 remaining nodes for:
 - Additional vLLM instances (different models)
+- Multiple concurrent model serving
 - Jupyter notebooks for researchers
 - Training workloads
+- Fine-tuning experiments
 - Other GPU tasks
 
 ### Scaling vLLM Replicas
 
-**If you need higher throughput:**
+**If you need higher throughput, you can scale across all 5 GPU nodes:**
 
 ```yaml
-# Scale vLLM to use both H100 nodes (2 replicas)
+# Scale vLLM to use all 5 H100 nodes
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: vllm
 spec:
-  replicas: 2  # One pod per H100 node
+  replicas: 5  # One pod per H100 node
   template:
     spec:
       affinity:
@@ -1392,14 +1401,18 @@ spec:
               matchLabels:
                 app: vllm
             topologyKey: kubernetes.io/hostname
+      resources:
+        limits:
+          nvidia.com/gpu: "4"  # Each pod uses all 4 GPUs on its node
       # ... rest of spec
 ```
 
-This ensures:
-- 1 vLLM pod per H100 node
-- Both nodes utilized
-- Higher total throughput
-- Redundancy (if one node fails)
+This configuration:
+- Deploys 1 vLLM pod per GPU node (5 total)
+- Uses all 20 H100 GPUs for maximum throughput
+- Provides 5x the inference capacity
+- Offers redundancy (if one node fails, 4 remain)
+- Enables load balancing across replicas via OGX
 
 ### Researcher GPU Access
 
@@ -1414,13 +1427,13 @@ metadata:
   namespace: researcher-a
 spec:
   nodeSelector:
-    node-role.kubernetes.io/h100: ""
+    nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3
   containers:
   - name: jupyter
     image: jupyter/pytorch-notebook:latest
     resources:
       limits:
-        nvidia.com/gpu: "1"  # Request 1 GPU
+        nvidia.com/gpu: "1"  # Request 1 GPU (out of 4 on the node)
 ```
 
 **ResourceQuota to limit GPU usage:**
